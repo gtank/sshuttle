@@ -159,8 +159,8 @@ class FirewallClient:
         self.pfile.flush()
         line = self.pfile.readline()
         self.check()
-        if line != 'STARTED\n':
-            raise Fatal('%r expected STARTED, got %r' % (self.argv, line))
+        if line not in ['STARTED\n', 'success\n']:
+            raise Fatal('%r expected success, got %r' % (self.argv, line))
 
     def sethostip(self, hostname, ip):
         assert(not re.search(r'[^-\w\.]', hostname))

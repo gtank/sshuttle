@@ -64,6 +64,40 @@ def ipt_ttl(*args):
         ipt(*args)
 
 
+def firewalld_chain_exists(name):
+    argv = ['firewall-cmd', '--direct', '--passthrough', 'ipv4', '-t', 'nat', '-nL']
+    p = ssubprocess.Popen(argv, stdout = ssubprocess.PIPE)
+    for line in p.stdout:
+        if line.startswith('Chain %s ' % name):
+            return True
+    rv = p.wait()
+    if rv:
+        raise Fatal('%r returned %d' % (argv, rv))
+
+
+def firewalld(*args):
+    argv = ['firewall-cmd', '--direct', '--passthrough', 'ipv4', '-t', 'nat'] + list(args)
+    _call(argv)
+
+
+def firewalld_ttl(*args):
+    global _no_ttl_module
+    if not _no_ttl_module:
+        # we avoid infinite loops by generating server-side connections
+        # with ttl 42.  This makes the client side not recapture those
+        # connections, in case client == server.
+        try:
+            argsplus = list(args) + ['-m', 'ttl', '!', '--ttl', '42']
+            firewalld(*argsplus)
+        except Fatal:
+            firewalld(*args)
+            # we only get here if the non-ttl attempt succeeds
+            log('sshuttle: warning: your iptables is missing '
+                'the ttl module.\n')
+            _no_ttl_module = True
+    else:
+        firewalld(*args)
+
 
 # We name the chain based on the transproxy port number so that it's possible
 # to run multiple copies of sshuttle at the same time.  Of course, the
@@ -111,6 +145,51 @@ def do_iptables(port, dnsport, subnets):
                     '-p', 'udp',
                     '--dport', '53',
                     '--to-ports', str(dnsport))
+
+
+# This does exactly the same thing as the iptables version, but uses the
+# firewall-cmd direct passthrough instead to avoid conflicting with firewalld
+def do_firewalld(port, dnsport, subnets):
+    chain = 'sshuttle-%s' % port
+
+    # basic cleanup/setup of chains
+    if firewalld_chain_exists(chain):
+        nonfatal(firewalld, '-D', 'OUTPUT', '-j', chain)
+        nonfatal(firewalld, '-D', 'PREROUTING', '-j', chain)
+        nonfatal(firewalld, '-F', chain)
+        firewalld('-X', chain)
+
+    if subnets or dnsport:
+        firewalld('-N', chain)
+        firewalld('-F', chain)
+        firewalld('-I', 'OUTPUT', '1', '-j', chain)
+        firewalld('-I', 'PREROUTING', '1', '-j', chain)
+
+    if subnets:
+        # create new subnet entries.  Note that we're sorting in a very
+        # particular order: we need to go from most-specific (largest swidth)
+        # to least-specific, and at any given level of specificity, we want
+        # excludes to come first.  That's why the columns are in such a non-
+        # intuitive order.
+        for swidth,sexclude,snet in sorted(subnets, reverse=True):
+            if sexclude:
+                firewalld('-A', chain, '-j', 'RETURN',
+                    '--dest', '%s/%s' % (snet,swidth),
+                    '-p', 'tcp')
+            else:
+                firewalld_ttl('-A', chain, '-j', 'REDIRECT',
+                          '--dest', '%s/%s' % (snet,swidth),
+                          '-p', 'tcp',
+                          '--to-ports', str(port))
+
+    if dnsport:
+        nslist = resolvconf_nameservers()
+        for ip in nslist:
+            firewalld_ttl('-A', chain, '-j', 'REDIRECT',
+                      '--dest', '%s/32' % ip,
+                      '-p', 'udp',
+                      '--dport', '53',
+                      '--to-ports', str(dnsport))
 
 
 def ipfw_rule_exists(n):
@@ -462,6 +541,8 @@ def main(port, dnsport, syslog):
 
     if program_exists('ipfw'):
         do_it = do_ipfw
+    elif program_exists('firewall-cmd'):
+        do_it = do_firewalld
     elif program_exists('iptables'):
         do_it = do_iptables
     else:
